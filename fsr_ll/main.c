@@ -95,7 +95,7 @@ int main() {
     for (int i = 0; ; i++) {
         memset(buf, 0xAA, sizeof(buf));
         ret = FSR_STL_Read(0, 0x15, i, 1, buf, 0);
-        printf("FSR_STL_Read(%d): 0x%x\n", i, ret);
+        //printf("FSR_STL_Read(%d): 0x%x\n", i, ret);
 
         if (ret != 0) break;
 
