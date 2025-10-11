@@ -1,6 +1,9 @@
 import os
 from qiling import Qiling
+from qiling.const import QL_VERBOSE
 import struct
+import sys
+import stat
 
 
 def abort():
@@ -8,8 +11,13 @@ def abort():
     os._exit(-1)
 
 
-onenand_bin = open("onenand.bin", "rb")
-onenand_oob = open("onenand.oob", "rb")
+onenand_bin = open(sys.argv[1], "rb")
+onenand_oob = open(sys.argv[2], "rb")
+
+output = os.path.join(os.path.dirname(sys.argv[0]), "output.bin")
+if os.path.isfile(output):
+    os.chmod(output, stat.S_IWRITE)
+    os.remove(output)
 
 
 class Onenand:
@@ -32,7 +40,7 @@ class Onenand:
 
     def _read(self):
         # regular read
-        print("!!! read(0x{:X}, 0x{:X}, 0x{:X})".format(self.start_addr_1, self.start_addr_2, self.start_addr_8))
+        #print("!!! read(0x{:X}, 0x{:X}, 0x{:X})".format(self.start_addr_1, self.start_addr_2, self.start_addr_8))
 
         if self.start_buf_reg != 0x800:
             abort()
@@ -42,7 +50,7 @@ class Onenand:
             abort()
 
         off = self.start_addr_1 * 64 * 4096 + (self.start_addr_8 >> 2) * 4096
-        print("-- flash offset 0x{:X}".format(off))
+        #print("-- flash offset 0x{:X}".format(off))
         onenand_bin.seek(off)
         self.dataram = onenand_bin.read(4096)
         onenand_oob.seek(off // 512 * 16)
@@ -93,7 +101,7 @@ class Onenand:
         elif offset == 0x1E498:
             pass
         elif offset == 0x1E440:
-            print("==> OneNAND CMD 0x{:X}".format(value))
+            #print("==> OneNAND CMD 0x{:X}".format(value))
             self.int = 0
 
             if value == 0x65:
@@ -120,7 +128,7 @@ onenand = Onenand()
 
 
 if __name__ == "__main__":
-    ql = Qiling([r'main'], ".")
+    ql =  Qiling([r'main'], ".", verbose=QL_VERBOSE.OFF)
 
     def cb_read(ql, offset, size):
         return onenand.read_reg(offset, size)
@@ -131,3 +139,6 @@ if __name__ == "__main__":
     ql.mem.map_mmio(0xfc600000, 0x20000, cb_read, cb_write)
 
     ql.run()
+    
+    if os.path.isfile(output):
+        os.chmod(output, stat.S_IWRITE)
