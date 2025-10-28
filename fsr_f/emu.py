@@ -12,8 +12,8 @@ def abort():
 
 mu = Uc(UC_ARCH_ARM, UC_MODE_ARM)
 
-onenand_bin = open("onenand.bin", "rb")
-onenand_oob = open("onenand.oob", "rb")
+onenand_bin = open(sys.argv[2], "rb")
+onenand_oob = open(sys.argv[3], "rb")
 
 
 class Onenand:
@@ -200,7 +200,7 @@ def post_print(uc, address, size, user_data):
 
 
 def main():
-    with open("secondbl.bin", "rb") as inf:
+    with open(os.path.join(os.path.dirname(__file__), "secondbl.bin"), "rb") as inf:
         code = inf.read()
 
     mu.mem_map(0x60c01000, 0x40000)
@@ -242,7 +242,7 @@ def main():
 
         print("read start")
 
-        with open(sys.argv[2], "wb") as outf:
+        with open(sys.argv[4], "wb") as outf:
             for blk in range(2 ** 32):
                 mu.reg_write(UC_ARM_REG_SP, 0x70010000)
 
@@ -251,10 +251,10 @@ def main():
                 mu.reg_write(UC_ARM_REG_R2, blk)
                 mu.reg_write(UC_ARM_REG_R3, 1)
                 mu.mem_write(mu.reg_read(UC_ARM_REG_SP), struct.pack("<II", buf_ptr, 0))
-                print("read 0x{:X}".format(blk))
+                #print("read 0x{:X}".format(blk))
                 mu.emu_start(0x60c09b48, 0x60c09c84)
                 ret = mu.reg_read(UC_ARM_REG_R0)
-                print("FSR_STL_Read() => {}".format(ret))
+                #print("FSR_STL_Read() => {}".format(ret))
 
                 if ret != 0:
                     break
