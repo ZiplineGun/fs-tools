@@ -4,20 +4,15 @@ from qiling.const import QL_VERBOSE
 import struct
 import sys
 import stat
-
+import shutil
 
 def abort():
     print("!! runtime abort !!")
     os._exit(-1)
 
-
 onenand_bin = open(sys.argv[1], "rb")
 onenand_oob = open(sys.argv[2], "rb")
-
-output = os.path.join(os.path.dirname(sys.argv[0]), "output.bin")
-if os.path.isfile(output):
-    os.chmod(output, stat.S_IWRITE)
-    os.remove(output)
+output = sys.argv[3]
 
 
 class Onenand:
@@ -128,7 +123,13 @@ onenand = Onenand()
 
 
 if __name__ == "__main__":
-    ql =  Qiling([r'main'], ".", verbose=QL_VERBOSE.OFF)
+    os.chdir(os.path.dirname(__file__))
+    
+    if os.path.isfile("output.bin"):
+        os.chmod("output.bin", stat.S_IWRITE)
+        os.remove("output.bin")
+    
+    ql =  Qiling(['main'], ".", verbose=QL_VERBOSE.OFF)
 
     def cb_read(ql, offset, size):
         return onenand.read_reg(offset, size)
@@ -140,5 +141,8 @@ if __name__ == "__main__":
 
     ql.run()
     
-    if os.path.isfile(output):
-        os.chmod(output, stat.S_IWRITE)
+    if os.path.isfile("output.bin"):
+        os.chmod("output.bin", stat.S_IWRITE)
+        
+    shutil.move("output.bin", output)
+        
