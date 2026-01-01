@@ -5,25 +5,29 @@ def main(input_path, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
     with open(input_path, "rb") as file:
-        binary = file.read()
+        image = file.read()
         
-    output_offsets = []
-    binary_len = len(binary)
+    fat_offsets = []
+    image_size = len(image)
     
-    for offset in range(0, binary_len-0x10, 0x10):
-        if binary[offset+3:offset+3+8] != b"MSDOS5.0": continue
-        output_offsets.append(offset)
+    for offset in range(0, image_size, 0x200):
+        if image[offset + 0x2B : offset + 0x36] != b"NECVOL     ":
+            continue
+        if image[offset + 0x1FE : offset + 0x200] != b"\x55\xAA":
+            continue
+
+        fat_offsets.append(offset)
         print(f"FAT found: {hex(offset)}")
     
-    if len(output_offsets) == 0:
+    if len(fat_offsets) == 0:
         raise Exception("not found!")
         
-    output_offsets.append(binary_len)
+    fat_offsets.append(image_size)
     
-    for i in range(len(output_offsets)-1):
-        output_path = os.path.join(output_dir, f"fat_{output_offsets[i]:08X}.bin")
+    for i in range(len(fat_offsets)-1):
+        output_path = os.path.join(output_dir, f"{i}_FAT_{fat_offsets[i]:08X}.bin")
         with open(output_path, "wb") as output:
-            output.write(binary[output_offsets[i]:output_offsets[i+1]])
+            output.write(image[fat_offsets[i] : fat_offsets[i+1]])
 
 
 if __name__ == "__main__":
