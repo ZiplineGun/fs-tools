@@ -1,8 +1,13 @@
 from unicorn import *
 from unicorn.arm_const import *
 import os
+import shutil
 import struct
 import sys
+import tempfile
+from pathlib import Path
+
+import unicorn
 
 
 SEPARATION_SLC = 0
@@ -56,31 +61,137 @@ def abort(uc):
 
 
 class OnenandFlash:
-    def __init__(self, onenand, image_path):
-        self.onenand = onenand
-        self.onenand_bin = open(image_path + ".bin", "rb")
-        self.onenand_oob = open(image_path + ".oob", "rb")
-        if image_path.endswith("_mlc"):
-            self.pages_per_block = MLC_PAGES_PER_BLOCK
-        else:
-            self.pages_per_block = SLC_PAGES_PER_BLOCK
+    """OneNAND image reader with automatic OOB layout detection.
 
-        self.size = self.onenand_bin.seek(0, os.SEEK_END)
+    Supported inputs:
+      * data-only .bin with an optional sibling .oob file
+      * raw page-interleaved .bin (4096-byte data + 128-byte OOB per page)
+      * data-only .bin without OOB (spare bytes are treated as erased, 0xFF)
+    """
+
+    def __init__(self, onenand, image_path, pages_per_block):
+        self.onenand = onenand
+        self.image_path = self._resolve_image_path(image_path)
+        self.pages_per_block = pages_per_block
+        self.onenand_bin = open(self.image_path, "rb")
+        self.onenand_oob = None
+        self.oob_stride = 0
+        self.layout = None
+
+        raw_size = os.fstat(self.onenand_bin.fileno()).st_size
+        page_size = self.onenand.page_size
+        spare_size = self.onenand.spare_size
+        raw_page_size = page_size + spare_size
+
+        oob_path = self._find_oob_path(self.image_path)
+        if oob_path is not None:
+            if raw_size == 0 or raw_size % page_size != 0:
+                self.close()
+                raise ValueError(
+                    f"Data image size is not a multiple of {page_size}: {self.image_path}"
+                )
+            self.layout = "split-oob"
+            self.size = raw_size
+            self.onenand_oob = open(oob_path, "rb")
+            oob_file_size = os.fstat(self.onenand_oob.fileno()).st_size
+            page_count = self.size // page_size
+            if page_count == 0 or oob_file_size % page_count != 0:
+                self.close()
+                raise ValueError(f"Cannot determine OOB size from: {oob_path}")
+            self.oob_stride = oob_file_size // page_count
+            if self.oob_stride == 0:
+                self.close()
+                raise ValueError(f"OOB file is empty: {oob_path}")
+            print(f"OOB detected: {oob_path} ({self.oob_stride} bytes/page)")
+        elif (
+            raw_size % raw_page_size == 0
+            and self._is_power_of_two((raw_size // raw_page_size) * page_size)
+        ):
+            self.layout = "interleaved-oob"
+            page_count = raw_size // raw_page_size
+            self.size = page_count * page_size
+            print(f"Embedded OOB detected: {self.image_path} ({spare_size} bytes/page)")
+        elif raw_size > 0 and raw_size % page_size == 0:
+            self.layout = "data-only"
+            self.size = raw_size
+            print(f"No OOB sidecar found; using data-only image: {self.image_path}")
+        else:
+            self.close()
+            raise ValueError(
+                f"Unsupported OneNAND image size ({raw_size} bytes): {self.image_path}"
+            )
+
         self.blocks = self.size // (self.pages_per_block * self.onenand.page_size)
+        if self.blocks == 0:
+            self.close()
+            raise ValueError(f"Image is too small to contain a block: {self.image_path}")
+
+    @staticmethod
+    def _is_power_of_two(value):
+        return value > 0 and (value & (value - 1)) == 0
+
+    @staticmethod
+    def _resolve_image_path(image_path):
+        path = Path(image_path).expanduser()
+        if path.is_file():
+            return path.resolve()
+        if path.suffix.lower() != ".bin":
+            appended = Path(str(path) + ".bin")
+            if appended.is_file():
+                return appended.resolve()
+        raise FileNotFoundError(f"OneNAND image not found: {image_path}")
+
+    @staticmethod
+    def _find_oob_path(image_path):
+        candidates = (
+            image_path.with_suffix(".oob"),
+            Path(str(image_path) + ".oob"),
+            image_path.with_suffix(".OOB"),
+            Path(str(image_path) + ".OOB"),
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _read_spare(self, page_index):
+        spare_size = self.onenand.spare_size
+        if self.layout == "split-oob":
+            self.onenand_oob.seek(page_index * self.oob_stride)
+            spare = self.onenand_oob.read(self.oob_stride)[:spare_size]
+        elif self.layout == "interleaved-oob":
+            raw_page_size = self.onenand.page_size + spare_size
+            self.onenand_bin.seek(page_index * raw_page_size + self.onenand.page_size)
+            spare = self.onenand_bin.read(spare_size)
+        else:
+            spare = b""
+        return bytearray(spare.ljust(spare_size, b"\xFF"))
 
     def read_page(self, uc, block, page_in_block):
-        off = (
-            block * self.pages_per_block + page_in_block
-        ) * self.onenand.page_size
-        assert off < self.size
-        assert off + self.onenand.page_size < self.size
-        # print("-- flash offset 0x{:X}".format(off))
-        self.onenand_bin.seek(off)
-        self.onenand.dataram = bytearray(self.onenand_bin.read(self.onenand.page_size))
-        self.onenand_oob.seek(off // 512 * 16)
-        self.onenand.spareram = bytearray(self.onenand_oob.read(self.onenand.spare_size))
+        page_index = block * self.pages_per_block + page_in_block
+        off = page_index * self.onenand.page_size
+        if off < 0 or off + self.onenand.page_size > self.size:
+            raise IndexError(f"OneNAND page out of range: block={block}, page={page_in_block}")
+
+        if self.layout == "interleaved-oob":
+            raw_page_size = self.onenand.page_size + self.onenand.spare_size
+            self.onenand_bin.seek(page_index * raw_page_size)
+        else:
+            self.onenand_bin.seek(off)
+        data = self.onenand_bin.read(self.onenand.page_size)
+        if len(data) != self.onenand.page_size:
+            raise EOFError(f"Short read from OneNAND image: {self.image_path}")
+
+        self.onenand.dataram = bytearray(data)
+        self.onenand.spareram = self._read_spare(page_index)
         self.onenand._sync_dataram_to_ram(uc)
         self.onenand._sync_spareram_to_ram(uc)
+
+    def close(self):
+        for stream_name in ("onenand_bin", "onenand_oob"):
+            stream = getattr(self, stream_name, None)
+            if stream is not None and not stream.closed:
+                stream.close()
 
 
 class Onenand:
@@ -115,17 +226,89 @@ class Onenand:
         self.override_page = dict()
         self.override_spare = dict()
 
-    def _open_image(self, image_path):
-        if not os.path.exists(image_path + ".bin"):
-            self.print_debug("Image not found: '{:}.bin'".format(image_path))
-            return
-        if image_path.endswith("_mlc"):
-            self.print_debug("MLC image: '{:}.bin'".format(image_path))
-            self.onenand_mlc = OnenandFlash(self, image_path)
+    def _open_image(self, image_path, kind="slc"):
+        if kind == "mlc":
+            self.print_debug(f"MLC image: '{image_path}'")
+            self.onenand_mlc = OnenandFlash(self, image_path, MLC_PAGES_PER_BLOCK)
         else:
-            # both onenand_slc and onenand fall here
-            self.print_debug("SLC image: '{:}.bin'".format(image_path))
-            self.onenand_slc = OnenandFlash(self, image_path)
+            self.print_debug(f"SLC image: '{image_path}'")
+            self.onenand_slc = OnenandFlash(self, image_path, SLC_PAGES_PER_BLOCK)
+
+    def open(self, image_path, mlc_image_path=None):
+        if mlc_image_path is not None:
+            # Explicit SLC + MLC input files (Flex-OneNAND).
+            self._open_image(image_path, "slc")
+            self._open_image(mlc_image_path, "mlc")
+            self.did |= SEPARATION_FLEX << 8
+        else:
+            # Preserve the convenience of passing just *_slc.bin or *_mlc.bin:
+            # if its sibling exists, open both files automatically.
+            image = Path(image_path).expanduser()
+            if image.suffix.lower() == ".bin":
+                stem = image.stem
+                ext = image.suffix
+            else:
+                stem = image.name
+                ext = ".bin"
+            if stem.endswith(("_slc", "_mlc")):
+                base_stem = stem[:-4]
+                slc_path = image.with_name(base_stem + "_slc" + ext)
+                mlc_path = image.with_name(base_stem + "_mlc" + ext)
+                if slc_path.is_file() and mlc_path.is_file():
+                    self._open_image(slc_path, "slc")
+                    self._open_image(mlc_path, "mlc")
+                    self.did |= SEPARATION_FLEX << 8
+                else:
+                    self._open_image(image_path, "slc")
+            else:
+                self._open_image(image_path, "slc")
+
+        total_size = 0
+        separation = (self.did >> 8) & 0b11
+        if self.onenand_slc and self.onenand_mlc:
+            assert separation == SEPARATION_FLEX
+            separation_str = "Flex-OneNAND"
+            total_size = self.onenand_slc.size + self.onenand_mlc.size
+            # One SLC block is reserved for Partition Information.
+            total_size += SLC_PAGES_PER_BLOCK * self.page_size
+        elif self.onenand_slc:
+            assert separation == SEPARATION_SLC
+            separation_str = "SLC"
+            total_size = self.onenand_slc.size
+        elif self.onenand_mlc:
+            raise ValueError("MLC-only OneNAND images are not supported")
+        else:
+            raise ValueError("No OneNAND image loaded")
+
+        if total_size == 0:
+            raise ValueError("Total NAND size is 0")
+        if total_size & (total_size - 1):
+            raise ValueError(f"Total NAND size '{total_size}' is not a power of 2")
+        density = 0
+        while total_size != (1 << (density + 4)) << 20:
+            density += 1
+            if density > 0xF:
+                raise ValueError(
+                    f"Total NAND size '{total_size}' doesn't match an expected size"
+                )
+        self.did |= (density & 0xF) << 4
+
+        self.print_debug("DeviceID: {:04X}".format(self.did))
+        self.print_debug("* DeviceID [1:0]  Vcc:           {:0b}".format(self.did & 0b11))
+        self.print_debug("* DeviceID [2]    Muxed/Demuxed: {:0b}".format((self.did >> 2) & 0b1))
+        self.print_debug("* DeviceID [3]    Single/DDP:    {:0b}".format((self.did >> 3) & 0b1))
+        self.print_debug("* DeviceID [7:4]  Density:       {:04b} = {}".format((self.did >> 4) & 0xF, total_size))
+        self.print_debug("* DeviceID [9:8]  Separation:    {:02b} = {}".format(separation, separation_str))
+
+        if self.onenand_slc and self.onenand_mlc:
+            assert self.onenand_slc.blocks > 0
+            alloc = self.onenand_slc.blocks - 1
+            if alloc > 0xFFFF:
+                self.print_debug("Warning: Alloc value beyond max! wrong files? 0x{:04X}".format(alloc))
+                alloc = 0xFFFF
+            struct.pack_into("<H", self.partition_information, 0, alloc)
+
+        self.print_debug("* Boundary block: 0x{:04X}".format(self._get_boundary_address()))
 
     def _get_boundary_address(self):
         # Return the configured boundary block where SLC ends 
@@ -437,54 +620,86 @@ def emu_run_func(uc, bootloader, func):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Please provide nand dump to use")
-        os._exit(1)
-    if len(sys.argv) < 3:
-        sys.argv.append("secondbl.bin")
+    script_dir = Path(__file__).resolve().parent
+    argv = sys.argv[1:]
+    bootloader_arg = None
+    if "--bootloader" in argv or "-b" in argv:
+        flag = "--bootloader" if "--bootloader" in argv else "-b"
+        flag_index = argv.index(flag)
+        if flag_index + 1 >= len(argv):
+            raise SystemExit(f"{flag} requires a file path")
+        bootloader_arg = argv[flag_index + 1]
+        del argv[flag_index:flag_index + 2]
 
-    with open(sys.argv[2], "rb") as inf:
+    if len(argv) not in (2, 3):
+        raise SystemExit(
+            "Usage:\n"
+            "  python emu.py path/to/onenand.bin path/to/output\n"
+            "  python emu.py path/to/onenand_slc.bin path/to/onenand_mlc.bin path/to/output\n"
+            "Optional: --bootloader path/to/secondbl.bin"
+        )
+
+    if len(argv) == 2:
+        image_paths = [argv[0]]
+        output_path = Path(argv[1]).expanduser().resolve()
+    else:
+        image_paths = [argv[0], argv[1]]
+        output_path = Path(argv[2]).expanduser().resolve()
+
+    if bootloader_arg:
+        bootloader_path = Path(bootloader_arg).expanduser().resolve()
+    else:
+        bootloader_path = script_dir / "secondbl.bin"
+        if not bootloader_path.is_file() and (Path.cwd() / "secondbl.bin").is_file():
+            bootloader_path = Path.cwd() / "secondbl.bin"
+
+    if not bootloader_path.is_file():
+        raise FileNotFoundError(
+            f"Bootloader file not found: {bootloader_path} (use --bootloader to specify it)"
+        )
+
+    with open(bootloader_path, "rb") as inf:
         bootloader_code = inf.read()
+    if len(bootloader_code) < 0x1F3:
+        raise ValueError(f"Bootloader is too small: {bootloader_path}")
 
     bootloader = bootloader_code[0x1E0:0x1F3].decode("ascii").replace("\0", " ")
-    print("Emulated BL '{:}' string: '{:}'".format(sys.argv[2], bootloader))
-
-    image_path = sys.argv[1].removesuffix(".bin")
-    onenand.open(image_path)
-    part_path = image_path.removesuffix("_slc").removesuffix("_mlc") + "_part"
-
+    print("Emulated BL '{:}' string: '{:}'".format(bootloader_path, bootloader))
     if bootloader not in BOOTLOADER_ADDRESES:
-        print("Unknown bootloader provided!")
-        os._exit(1)
+        raise ValueError(f"Unknown bootloader provided: '{bootloader}'")
 
-    for partnum in [0x14, 0x15, 0x19, 0x1A]:
-        #print("Partnum => 0x{:X}".format(partnum))
+    global onenand
+    onenand = Onenand()
+    if len(image_paths) == 2:
+        onenand.open(image_paths[0], image_paths[1])
+    else:
+        onenand.open(image_paths[0])
+
+    # Unicorn writes the generated image beside this script first. Once the
+    # conversion finishes, move that temporary file to the requested target.
+    fd, temp_output = tempfile.mkstemp(prefix=".emu_part_1A_", suffix=".bin", dir=script_dir)
+    os.close(fd)
+    temp_output_path = Path(temp_output)
+    try:
+        partnum = 0x1A
         uc = Uc(UC_ARCH_ARM, UC_MODE_ARM)
 
         uc.mem_map(0x60C01000, 0x40000)
         uc.mem_write(0x60C01000, bootloader_code)
 
         uc.reg_write(UC_ARM_REG_SP, 0xE7A91FFC)
-        # map stack space
         uc.mem_map(0xE7A90000, 0x2000)
-
-        # bss
         uc.mem_map(0x61100000, 0x950000)
-
         uc.mem_map(0x70000000, 0x100000)
         info_ptr = 0x70000000 + 0x4000
         buf_ptr = 0x70000000
 
-        # onenand: page-data (0x400-0x1400) and spare (0x10020-0x100A0)
-        # buffers are plain memory from the CPU's point of view, so map
-        # them as real RAM to avoid a Python callback on every word access.
+        # Map data/spare buffers as RAM and only control registers as MMIO.
         uc.mem_map(ONENAND_BASE, BUF_REGION_SIZE)
-        # onenand: control/status registers still go through Python.
         uc.mmio_map(
             CTRL_REGION_BASE, CTRL_REGION_SIZE, onenand_read, None, onenand_write, None
         )
 
-        # printf
         printf_end = BOOTLOADER_ADDRESES[bootloader]["printf_end"]
         uc.hook_add(
             UC_HOOK_CODE,
@@ -494,15 +709,12 @@ def main():
             user_data=bootloader,
         )
 
-        # uc.hook_add(UC_HOOK_CODE, hook_code)
-
         try:
-            # FSR_STL_Init
             emu_run_func(uc, bootloader, "FSR_STL_Init")
             result = uc.reg_read(UC_ARM_REG_R0)
             print("FSR_STL_Init => 0x{:X}".format(result))
             if result != 0:
-                break
+                raise RuntimeError(f"FSR_STL_Init failed: 0x{result:X}")
 
             uc.reg_write(UC_ARM_REG_R0, 0)
             uc.reg_write(UC_ARM_REG_R1, partnum)
@@ -512,19 +724,13 @@ def main():
             result = uc.reg_read(UC_ARM_REG_R0)
             print("FSR_STL_Open => 0x{:X}".format(result))
             if result != 0:
-                if result == 0x80030002:
-                    # Unknown partnum
-                    continue
-                else:
-                    break
+                raise RuntimeError(f"FSR_STL_Open failed for part 0x1A: 0x{result:X}")
 
             print("Read start")
-
-            with open("{}_{:X}.bin".format(part_path, partnum), "wb") as outf:
-                blk = 0
+            blk = 0
+            with open(temp_output_path, "wb") as outf:
                 while True:
                     uc.reg_write(UC_ARM_REG_SP, 0x70010000)
-
                     uc.reg_write(UC_ARM_REG_R0, 0)
                     uc.reg_write(UC_ARM_REG_R1, partnum)
                     uc.reg_write(UC_ARM_REG_R2, blk)
@@ -536,24 +742,29 @@ def main():
                         print("Reading part 0x{:X} block 0x{:X}".format(partnum, blk))
                     emu_run_func(uc, bootloader, "FSR_STL_Read")
                     ret = uc.reg_read(UC_ARM_REG_R0)
-                    if ret != 0:
-                        print("FSR_STL_Read() => 0x{:X}".format(ret))
-
                     if ret == 0x80030000:
                         break
-                    elif ret != 0:
-                        raise RuntimeError("Unexpected result")
-
-                    data = uc.mem_read(buf_ptr, 512)
-                    outf.write(data)
+                    if ret != 0:
+                        raise RuntimeError(f"FSR_STL_Read failed: 0x{ret:X}")
+                    outf.write(uc.mem_read(buf_ptr, 512))
                     blk += 1
-                if blk == 0:
-                    raise RuntimeError("No block was read")
+
+            if blk == 0:
+                raise RuntimeError("No blocks were read for part 0x1A")
         except unicorn.UcError:
             print_regs(uc)
             raise
-        except:
-            raise
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(temp_output_path), str(output_path))
+        temp_output_path = None
+        print(f"Output written: {output_path}")
+    finally:
+        if temp_output_path is not None and temp_output_path.exists():
+            temp_output_path.unlink()
+        for flash in (onenand.onenand_slc, onenand.onenand_mlc):
+            if flash is not None:
+                flash.close()
 
 
 if __name__ == "__main__":
